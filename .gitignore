@@ -1,0 +1,7 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+clinical.csv
+genomics.csv
+data_cleaning.R
