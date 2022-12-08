@@ -19,6 +19,7 @@ library(data.table)
 library(caret)
 library(randomForest)
 library(parallel)
+library(stringr)
 ```
 
 ### Load and clean data
@@ -39,5 +40,308 @@ survival after diagnosis with NSCLC. In order to answer this question I create a
 ```{r}
 DT[,Outcome_num := factor(ifelse(Survival.Months > 12 & Outcome == "Dead",1,0))]
 ```
+
+I used `Outcome` and `Survival.Months` to create my new outcome that it will be used for the prediction. We are not using those variables anymore. Let's check the other variables 
+
++ `Age`: *The patient’s age (in years) at diagnosis*. Numerical variable, we don't need any transformation or cleaning. No missing data
+
++ `Grade`: *Tumor grade (1-4 or missing)*. 
+
+```{r}
+table(DT$Grade)
+```
+
+Using the description I can assume that the value *9* is referred to missing data. In this specific case I don't have any value `1`, but it could mean that those value are mixed in the code `9` and I cannot use any imputation on this variable because I don't have *missing at random*. Let's transform the variable in `factor`
+
+```{r}
+DT[, Grade := ifelse(Grade == 9, NA, Grade)]
+DT[, Grade := factor(Grade, exclude = NULL)]
+```
+
++ `Num.Primaries`: *Number of primary tumors*. Let's convert to factor. No missing data.
+
+```{r}
+DT[, Num.Primaries := factor(Num.Primaries, exclude = NULL)]
+```
+
++ `T`: *Tumor Stage*. In this variable we have 62 `"UNK"` (Unknown) data and a few class with a low sample size
+
+```{r}
+table(DT$`T`)
+```
+
+I decide to re-map the (1,1a,1b) &longrightarrow; 1, (2,2a,2b) &longrightarrow; 2 and UKN &longrightarrow; `NA`  
+
+```{r}
+DT[,`T` := factor(ifelse(`T` == "UNK",NA,
+                  ifelse(`T` %like% "1",1,
+                  ifelse(`T` %like% "2",2,
+                  ifelse(`T` %like% "3",3,4)))),exclude = NULL)]
+```
+
++ `N`: *Number of metastasis to lymph nodes*. In this variable we have 65 `"NULL"` (NULL) data and a few class with a low sample size
+
+```{r}
+table(DT$N)
+```
+
+I collapse together classes `0`+`1` and `2`+`3` and I map `"NULL"` in `NA`
+
+```{r}
+DT[, N := factor(ifelse(N %in% c("0","1"),"01",
+                 ifelse(N %in% c("2","3"),"2+",NA)),exclude = NULL)]
+```
+
++ `M`: *Number of distant metastases*. In this variable we have 96 `"NULL"` variable and only two left unbalanced categories. I convert to factor:
+
+```{r}
+DT[, M := factor(M,exclude = NULL)]
+```
+
++ `Radiation`: *Whether radiation took place (5) or not (0)*. No missing value and the two class are unbalanced. I map 0/5 in No/Yes and convert to a factor: 
+
+```{r}
+DT[, Radiation := factor(ifelse(Radiation == 0,"No","Yes"),exclude = NULL)]
+```
+
++ `Stage`: *Stage at diagnosis*. This variable doesn't have missing data but have problems on sample size per category and (possibly) errors on the labels (`1B` vs. `IB`). I drop the letters (`A`,`B`) and collapse the category based on the numeric stage only:
+
+```{r}
+table(DT$Stage, useNA = "ifany")
+DT[, Stage := factor(ifelse(Stage %like% "IV","IV",
+                     ifelse(Stage %like% "III","III",
+                     ifelse(Stage %like% "II","II","I"))))]
+```
+
++ `Primary.Site`: *Location of primary tumor*. In this variable I don't have any missing data but I have some subclasses with few observations. I simply transform to factor the classes. Having more knowledges on lungs functionality I could collapse similar regions.
+
+```{r}
+DT[, Primary.Site := factor(Primary.Site)]
+```
+
++ `Histology`: *The tumor histology*. In this variable I don't have any missing data, I simply transform to factor the classes. 
+
+```{r}
+DT[, Histology := factor(Histology)]
+```
+
++ `Tumor.Size`: *Size of the tumor at diagnosis*. Continuous variable with a lot of missing data called `"NULL"`. I think that this variable could be really important. Let's check the effect with a single logit regression:
+
+```{r}
+DT$Tumor.Size = as.numeric(DT$Tumor.Size)
+summary(glm(DT$Outcome_num~DT$Tumor.Size, 
+            family = binomial(link = "logit")))$coeff
+```
+
+I have a lot of missing data but the coefficient is significant. I wouldn't impute this value (too many data to impute I can introduce some biases in the dataset) but I keep it
+
++ `Num.Mutations` and `Num.Mutated.Genes`: *The total number mutations found in the tumor and the total number of genes with mutation*. Those two variables are highly correlated because the number of mutations of each mutated gene is going from 1 to 3. Individually they don't have any significance:
+
+```{r}
+summary(glm(DT$Outcome_num~DT$Num.Mutated.Genes, 
+            family = binomial(link = "logit")))$coeff
+
+summary(glm(DT$Outcome_num~DT$Num.Mutations, 
+            family = binomial(link = "logit")))$coeff
+```
+
+Let's create a ratio for the mutation. The coefficient of the ratio in logit regression is significant
+
+```{r}
+DT[, ratio_mut := ifelse(Num.Mutated.Genes > 0,
+                         Num.Mutations/Num.Mutated.Genes,
+                         1)]
+
+summary(glm(DT$Outcome_num~DT$ratio_mut, 
+            family = binomial(link = "logit")))$coeff
+```
+
+I keep only the `ratio_mut` variable for the analysis.
+
+### Chi-square test
+
+We want to test the correlation between the categorical variables and the outcome. Let's use a $\chi^2$ test to check the independency of the two variables:
+
+```{r, message=FALSE, warning=FALSE}
+cat_variable = names(DT)[c(5,6,7,8,9,10,11,12,13)]
+chisq_table = lapply(cat_variable,function(i){
+  data.table(Variable = i,
+             p_value = round(chisq.test(DT$Outcome_num,DT[[paste0(i)]])$p.value,4))
+})
+chisq_table = rbindlist(chisq_table)
+chisq_table
+```
+
+We reject the hypothesis of independency for all variables except for the `Num.Primaries`. We exclude the variables from the analysis.
+
+### Genomics dataset
+
+In order to include the genomics information into the analysis I pivot the long table of genomics to wide format to merge clinical dataset and genomic one. I also transform the variables into factors:
+
+```{r}
+genomics = dcast(genomics, ID ~ Gene, 
+                 value.var = "Gene", 
+                 fun.aggregate = length)
+genomics[,c(names(genomics)[-1]) := lapply(.SD,function(i) factor(i,exclude = NULL)),
+         .SDcols = names(genomics)[-1]]
+```
+
+### Merge the datasets
+
+```{r}
+DT = merge(DT[,.(ID,Age,Grade,`T`,N,M,Radiation,Stage,Primary.Site,
+                 Histology,Tumor.Size,Outcome_num,ratio_mut)],
+           genomics, by = "ID", all.x = T)
+```
+
+### Model
+
+I use a **Random Forest** algorithm to predict the outcome. I pick this algorithm because is powerful (mean estimation across multiple classification trees), fast and it can also consider *non-linearity*. I will include all the dummy variables related to the genes that have mutations (`1` if the gene have mutation for that individual, `0` otherwise) and all the variable that showed a significant association in the analysis above. In order to perform an additional variable selection I add a random variable to my dataset. Then checking the variable importance I will exclude all the variable that will have an importance lower than my random variable:  
+
+```{r}
+DT$random_variable = rnorm(NROW(DT),0,1)
+```
+
+I have a low sample size considering the missing data, not enough to split between **train** and **test** dataset. *Random Forest algorithm* (by it's implementation) can handle that problems using the **out-of-bag error**. The out-of-bag (**OOB**) error is the average error for each calculated using predictions from the trees that do not contain in their respective bootstrap sample, in this way I can avoid the test-set and also the cross-validation. Now I run an optimization grid to look for the parameters that minimize the OOB error:
+
+```{r, eval=FALSE}
+rf_grid = data.table(expand.grid(mtry = 5:40,
+                                 ntree = seq(1000,3000,250),
+                                 nodesize = 1:10))
+rf_grid$ID = 1:NROW(rf_grid)
+
+n_cores = detectCores() - 2
+cl = makeCluster(n_cores)
+clusterEvalQ(cl, {
+  library(randomForest)
+  library(data.table)
+  library(stringr)
+})
+
+clusterExport(cl, varlist = c("DT","rf_grid"))
+
+rf_opt = parLapplyLB(cl,1:NROW(rf_grid), function(j){
+  a = Sys.time()
+  set.seed(j)
+  rf = randomForest(as.factor(Outcome_num) ~ .,
+                    data = DT[,-c("ID"),with=F],
+                    na.action = "na.omit",
+                    mtry = rf_grid$mtry[j],
+                    replace = F,
+                    nodesize = rf_grid$nodesize[j],
+                    ntree = rf_grid$ntree[j])
+  b = Sys.time()
+  cat(paste0("Grid ",str_pad(j, 4, pad = "0"),
+             " - ",str_pad(round(as.numeric(b-a),4),6,side = "right", pad = "0"),
+             " secs - ntree: ",rf_grid$ntree[j]," - mtry: ",
+             str_pad(rf_grid$mtry[j], 2, pad = "0"),
+             " - nodesize: ",str_pad(rf_grid$nodesize[j], 2, pad = "0"),
+             " - oob_err_rate: ",str_pad(round(rf$err.rate[rf_grid$ntree[j],1],4),6,
+                                         side = "right", pad = "0"),
+             "\n"),
+      file = "rf_model.log",
+      append = TRUE)
+  return(NULL)
+})
+```
+
+Checking the results from the file `rf_model.log`. Here the parameters that produced the best performance:
+
+```{r}
+rf_opt = fread("rf_model.log")
+rf_opt = rf_opt[,c(2,4,8,11,14,17)]
+setnames(rf_opt,names(rf_opt),c("ID","secs","ntree","mtry","nodesize","err_rate_oob"))
+rf_opt[order(err_rate_oob)][1]
+```
+
+Let's explore the variable importance grid:
+
+```{r}
+set.seed(407)
+rf_model = randomForest(as.factor(Outcome_num) ~ .,
+                  data = DT[,-c("ID"),with=F],
+                  na.action = "na.omit",
+                  mtry = 15,
+                  replace = F,
+                  nodesize = 2,
+                  ntree = 1500)
+vimp = data.table(variables = rownames(varImp(rf_model)), varImp(rf_model))
+vimp[order(vimp$Overall,decreasing = TRUE)]
+```
+In the table I can notice that only 5 variables are above my random variable. So let's try to rerun the model considering only `Tumor.Size`,`Primary.Site`,`Stage`,`Grade`,`T`. I create a new optimization grid to have the best parameters for the new model:
+
+```{r, eval=FALSE}
+rf_grid_2 = data.table(expand.grid(mtry = 1:5,
+                                   ntree = seq(1000,3000,250),
+                                   nodesize = 1:10))
+rf_grid_2$ID = 1:NROW(rf_grid_2)
+
+n_cores = detectCores() - 2
+cl = makeCluster(n_cores)
+clusterEvalQ(cl, {
+  library(randomForest)
+  library(data.table)
+  library(stringr)
+})
+
+clusterExport(cl, varlist = c("DT","rf_grid_2"))
+
+rf_opt = parLapplyLB(cl,1:NROW(rf_grid_2), function(j){
+  a = Sys.time()
+  set.seed(j)
+  rf = randomForest(as.factor(Outcome_num) ~ Stage + Primary.Site + Tumor.Size + `T` + Grade,
+                    data = DT[,-c("ID"),with=F],
+                    na.action = "na.omit",
+                    mtry = rf_grid_2$mtry[j],
+                    replace = F,
+                    nodesize = rf_grid_2$nodesize[j],
+                    ntree = rf_grid_2$ntree[j])
+  b = Sys.time()
+  cat(paste0("Grid ",str_pad(j, 4, pad = "0"),
+             " - ",str_pad(round(as.numeric(b-a),4),6,side = "right", pad = "0"),
+             " secs - ntree: ",rf_grid_2$ntree[j]," - mtry: ",
+             str_pad(rf_grid_2$mtry[j], 2, pad = "0"),
+             " - nodesize: ",str_pad(rf_grid_2$nodesize[j], 2, pad = "0"),
+             " - oob_err_rate: ",str_pad(round(rf$err.rate[rf_grid_2$ntree[j],1],4),6,
+                                         side = "right", pad = "0"),
+             "\n"),
+      file = "rf_model_2.log",
+      append = TRUE)
+  return(NULL)
+})
+```
+
+Load the file with the optimization grid results from file `rf_model_2.log`:
+
+```{r}
+rf_opt = fread("rf_model_2.log")
+rf_opt = rf_opt[,c(2,4,8,11,14,17)]
+setnames(rf_opt,names(rf_opt),c("ID","secs","ntree","mtry","nodesize","err_rate_oob"))
+rf_opt[order(err_rate_oob)][1]
+```
+
+Analysis of the final model:
+
+```{r}
+set.seed(48)
+rf_model = randomForest(as.factor(Outcome_num) ~ Stage + Primary.Site + 
+                          Tumor.Size + `T` + Grade,
+                  data = DT[,-c("ID"),with=F],
+                  na.action = "na.omit",
+                  mtry = 3,
+                  replace = F,
+                  nodesize = 2,
+                  ntree = 1000)
+rf_model
+```
+
+From the summary results we can see that the OOB estimate of  error rate is 7.14%. The model makes 24% of 1^st^ type error and 1.3% 2^nd^ type error. The performance for the 1^st^ type error is not good but it gives a more conservative prediction.  
+
+
+Having more time and resources I could make a better merge between the classes, try to impute the variables that contains missing data and use the correlation/association between the variables. Having a better knowledge of the lungs I could also make assumption and/or provide a cleaner dataset for the analysis. Working with `lightgboost` or `xgboost` could provide a more refined estimations.      
+
+
+
+
 
 
